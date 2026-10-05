@@ -17,7 +17,9 @@ env:
 
 jobs:
   image:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Bencher credentials live on pgdogdev/pgdog. The SeatGeek fork has no
+    # BENCHER_API_KEY, so pushing the perf image fails closed.
+    if: github.repository == 'pgdogdev/pgdog' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # This initial runner is to assemble the docker image for the Bencher runner. It doesn't run any tests itself.
     # Bencher's runners do not have outside network access; requires us to have everything ready-to-go.
     runs-on: ubuntu-24.04

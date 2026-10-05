@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime};
+use tracing::warn;
 
 use crate::backend::{Error, pool::Address};
 
@@ -10,6 +11,13 @@ use crate::backend::{Error, pool::Address};
 /// Applied by [`TokenCache::refresh_at`] so callers never need to
 /// know or re-apply this value.
 const EXPIRY_BUFFER: Duration = Duration::from_secs(45);
+
+/// Minimum remaining lifetime required to hand out a cached token.
+///
+/// Below this threshold [`TokenCache::get_or_fetch`] and
+/// [`TokenCache::credentials_or_fetch`] fetch a replacement inline
+/// instead of returning a token that is about to expire (or already has).
+const MIN_REMAINING: Duration = Duration::from_secs(10);
 
 /// Credentials fetched from an external identity provider.
 ///
@@ -51,6 +59,18 @@ impl CachedToken {
             },
             expires_at: Some(expires_at),
             refresh_at: None,
+        }
+    }
+
+    /// True when the entry has at least [`MIN_REMAINING`] of validity left,
+    /// or when there is no absolute expiry (refresh_at-only entries).
+    fn has_sufficient_validity(&self) -> bool {
+        match self.expires_at {
+            Some(expires_at) => expires_at
+                .duration_since(SystemTime::now())
+                .map(|remaining| remaining >= MIN_REMAINING)
+                .unwrap_or(false),
+            None => true,
         }
     }
 }
@@ -95,12 +115,13 @@ impl From<&Address> for CacheKey {
 /// [`TokenCache::evict`] when a refresh fails. Callers (the auth layer) use
 /// [`TokenCache::get_or_fetch`], which:
 ///
-/// - Returns immediately when any token is cached (valid or stale). Stale
-///   tokens are acceptable for the brief window while the monitor is fetching
-///   a replacement; the server will reject the connection if the token has
-///   truly expired, which is the fallback signal to retry.
-/// - Blocks exactly once on a cold miss (first connection before the monitor
-///   has primed the cache, or after an eviction following a failed refresh).
+/// - Returns immediately when a cached token has at least [`MIN_REMAINING`]
+///   of validity left.
+/// - Fetches inline (and warns) when the cached token is expired or has under
+///   [`MIN_REMAINING`] left, so a stalled monitor refresh cannot keep handing
+///   out a dead token.
+/// - Blocks on a cold miss (first connection before the monitor has primed
+///   the cache, or after an eviction following a failed refresh).
 pub(crate) struct TokenCache {
     inner: Mutex<HashMap<CacheKey, CachedToken>>,
 }
@@ -196,11 +217,11 @@ impl TokenCache {
         self.inner.lock().remove(&CacheKey::from(addr));
     }
 
-    /// Return the cached token for `addr` if one exists, or call `fetcher`
-    /// to obtain one on a cold miss.
+    /// Return the cached token for `addr` if one exists with sufficient
+    /// remaining validity, or call `fetcher` to obtain a fresh one.
     ///
-    /// Always returns immediately when a token is present (valid or stale).
-    /// Blocks only on a true cold miss.
+    /// Returns immediately when a cached token has at least
+    /// [`MIN_REMAINING`] left. Otherwise fetches inline.
     pub(crate) async fn get_or_fetch<F, Fut>(
         &self,
         addr: &Address,
@@ -211,10 +232,13 @@ impl TokenCache {
         Fut: Future<Output = Result<(String, SystemTime), Error>>,
     {
         if let Some(cached) = self.inner.lock().get(&CacheKey::from(addr)).cloned() {
-            return Ok(cached.credentials.secret);
+            if cached.has_sufficient_validity() {
+                return Ok(cached.credentials.secret);
+            }
+            warn!("cached credentials expired, fetching inline [{}]", addr);
         }
 
-        // Cold miss — block once to prime the cache.
+        // Cold miss or insufficient validity — block to (re)prime the cache.
         // After this the monitor's refresh loop takes over.
         let (token, expires_at) = Box::pin(fetcher(addr.clone())).await?;
         self.set(addr, token.clone(), expires_at);
@@ -224,6 +248,9 @@ impl TokenCache {
     /// Like [`get_or_fetch`](Self::get_or_fetch), but for providers that
     /// compute their own refresh instant instead of relying on
     /// [`EXPIRY_BUFFER`] — see [`set_with_refresh_at`](Self::set_with_refresh_at).
+    ///
+    /// Entries stored this way have no absolute expiry, so a cached hit is
+    /// always returned; the monitor owns refresh timing via `refresh_at`.
     pub(crate) async fn get_or_fetch_with_refresh<F, Fut>(
         &self,
         addr: &Address,
@@ -257,10 +284,13 @@ impl TokenCache {
         Fut: Future<Output = Result<FetchedCredentials, Error>>,
     {
         if let Some(cached) = self.inner.lock().get(&CacheKey::from(addr)).cloned() {
-            return Ok(cached.credentials);
+            if cached.has_sufficient_validity() {
+                return Ok(cached.credentials);
+            }
+            warn!("cached credentials expired, fetching inline [{}]", addr);
         }
 
-        // Cold miss — block once to prime the cache.
+        // Cold miss or insufficient validity — block to (re)prime the cache.
         // After this the monitor's refresh loop takes over.
         let fetched = Box::pin(fetcher(addr.clone())).await?;
         let credentials = fetched.credentials.clone();
@@ -570,19 +600,42 @@ mod tests {
     }
 
     #[test]
-    fn stale_token_returned_without_calling_fetcher() {
+    fn expired_token_is_refetched_inline() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let a = addr(9907);
-        // Expired — stale but still returned; monitor handles refresh.
+        // Expired — must not be returned; fetch a replacement inline.
         cache().set(&a, "stale".into(), past_expiry(60));
 
-        let token = rt.block_on(cache().get_or_fetch(&a, |_| async {
-            panic!("fetcher must not be called for a stale cached token");
-            #[allow(unreachable_code)]
-            Ok(("unreachable".into(), SystemTime::now()))
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+
+        let token = rt.block_on(cache().get_or_fetch(&a, move |_| {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            async { Ok(("fresh".into(), future_expiry(3600))) }
         }));
 
-        assert_eq!(token.unwrap(), "stale");
+        assert_eq!(token.unwrap(), "fresh");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        cache().evict(&a);
+    }
+
+    #[test]
+    fn nearly_expired_token_is_refetched_inline() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let a = addr(9923);
+        // Under MIN_REMAINING (10s) — treat as expired and refetch.
+        cache().set(&a, "nearly-stale".into(), future_expiry(5));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+
+        let token = rt.block_on(cache().get_or_fetch(&a, move |_| {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            async { Ok(("fresh".into(), future_expiry(3600))) }
+        }));
+
+        assert_eq!(token.unwrap(), "fresh");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         cache().evict(&a);
     }
 

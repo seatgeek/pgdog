@@ -182,7 +182,9 @@ impl Monitor {
     /// Keeps the token cache warm for this pool's address.
     ///
     /// Sleeps until just before the cached token expires, fetches a fresh
-    /// one, and repeats. On failure the stale entry is evicted so the next
+    /// one, and repeats. Each fetch is bounded by a 30s timeout so a hung
+    /// credential lookup cannot stall the loop forever. On failure or
+    /// timeout the stale entry is evicted so the next
     /// [`TokenCache::get_or_fetch`] call blocks on a real fetch rather than
     /// handing out an expired token indefinitely.
     ///
@@ -191,6 +193,7 @@ impl Monitor {
     async fn token_refresh(pool: Pool) {
         let addr = pool.addr().clone();
         let comms = pool.comms();
+        const TOKEN_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
         debug!("token refresh loop started [{}]", addr);
 
@@ -202,45 +205,54 @@ impl Monitor {
 
             select! {
                 _ = safe_sleep(sleep_duration) => {
-                    let result = match addr.server_auth {
-                        ServerAuth::RdsIam => Box::pin(rds_iam::token(addr.clone())).await.map(
-                            |(token, expires_at)| {
-                                TokenCache::global().set(&addr, token, expires_at)
-                            },
-                        ),
-                        ServerAuth::AzureWorkloadIdentity => {
-                            azure_workload_identity::token(addr.clone()).await.map(
-                                |(token, expires_at)| {
-                                    TokenCache::global().set(&addr, token, expires_at)
-                                },
-                            )
-                        }
-                        ServerAuth::VaultStatic => {
-                            vault::static_backend_credentials(addr.clone()).await.map(
-                                |(token, refresh_at)| {
-                                    TokenCache::global().set_with_refresh_at(
-                                        &addr, token, refresh_at,
-                                    )
-                                },
-                            )
-                        }
-                        ServerAuth::VaultDynamic => {
-                            vault::credentials(addr.clone()).await.map(|credentials| {
+                    if !addr.server_auth.is_external_identity() {
+                        break;
+                    }
+
+                    let refresh = async {
+                        match addr.server_auth {
+                            ServerAuth::RdsIam => {
+                                let (token, expires_at) =
+                                    Box::pin(rds_iam::token(addr.clone())).await?;
+                                TokenCache::global().set(&addr, token, expires_at);
+                            }
+                            ServerAuth::AzureWorkloadIdentity => {
+                                let (token, expires_at) =
+                                    azure_workload_identity::token(addr.clone()).await?;
+                                TokenCache::global().set(&addr, token, expires_at);
+                            }
+                            ServerAuth::VaultStatic => {
+                                let (token, refresh_at) =
+                                    vault::static_backend_credentials(addr.clone()).await?;
+                                TokenCache::global().set_with_refresh_at(
+                                    &addr, token, refresh_at,
+                                );
+                            }
+                            ServerAuth::VaultDynamic => {
+                                let credentials = vault::credentials(addr.clone()).await?;
                                 TokenCache::global().set_credentials(&addr, credentials);
                                 pool.lock().bump_credentials_generation();
-                            })
+                            }
+                            // Guarded by is_external_identity() above.
+                            _ => {}
                         }
-                        // Guard in spawn() ensures we only reach here for
-                        // external identity pools.
-                        _ => break,
+                        Ok::<(), crate::backend::Error>(())
                     };
 
-                    match result {
-                        Ok(()) => {
+                    match safe_timeout(TOKEN_FETCH_TIMEOUT, refresh).await {
+                        Ok(Ok(())) => {
                             debug!("token refreshed [{}]", addr);
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             warn!("token refresh failed, evicting cache entry: {err} [{}]", addr);
+                            TokenCache::global().evict(&addr);
+                        }
+                        Err(_) => {
+                            warn!(
+                                "token refresh timed out after {}s, evicting cache entry [{}]",
+                                TOKEN_FETCH_TIMEOUT.as_secs(),
+                                addr
+                            );
                             TokenCache::global().evict(&addr);
                         }
                     }
@@ -473,6 +485,19 @@ impl Monitor {
                     // We tried all passwords and they were all wrong.
                     if err.is_auth() {
                         pool.lock().stats.counts.auth_attempts += pool.addr().passwords.len();
+                        // Drop a rejected RDS IAM / Azure token so the next
+                        // attempt fetches a fresh one instead of retrying
+                        // the same bad credentials.
+                        if matches!(
+                            pool.addr().server_auth,
+                            ServerAuth::RdsIam | ServerAuth::AzureWorkloadIdentity
+                        ) {
+                            warn!(
+                                "auth failed for external identity pool, evicting cached token [{}]",
+                                pool.addr()
+                            );
+                            TokenCache::global().evict(pool.addr());
+                        }
                     }
                     error!(
                         "{}error connecting to server: {} [{}]",

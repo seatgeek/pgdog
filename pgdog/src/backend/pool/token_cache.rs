@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn nearly_expired_token_is_refetched_inline() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let a = addr(9923);
+        let a = addr(9924);
         // Under MIN_REMAINING (10s) — treat as expired and refetch.
         cache().set(&a, "nearly-stale".into(), future_expiry(5));
 

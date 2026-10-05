@@ -88,7 +88,9 @@ jobs:
 
               cp "target/${TARGET}/release/pgdog" "dist/${ARTIFACT}"
               chmod 755 "dist/${ARTIFACT}"
-              sha256sum "dist/${ARTIFACT}" | tee "dist/${ARTIFACT}.sha256"
+              # Hash from inside dist/ so the sidecar lists only the asset
+              # basename (sha256sum -c works next to the downloaded binary).
+              (cd dist && sha256sum "${ARTIFACT}" | tee "${ARTIFACT}.sha256")
               ldd "dist/${ARTIFACT}" || true
               "dist/${ARTIFACT}" --version || true
             '

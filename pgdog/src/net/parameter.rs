@@ -100,7 +100,6 @@ impl ToDataRowColumn for &'_ ParameterValue {
 }
 
 impl MemoryUsage for ParameterValue {
-    #[inline]
     fn memory_usage(&self) -> usize {
         match self {
             Self::String(v) => v.memory_usage(),
@@ -196,7 +195,6 @@ impl Display for Parameters {
 }
 
 impl MemoryUsage for Parameters {
-    #[inline]
     fn memory_usage(&self) -> usize {
         self.params.memory_usage() + self.hash.memory_usage()
     }
@@ -524,12 +522,18 @@ impl From<&Parameters> for Vec<Parameter> {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use crate::backend::server::test::test_server;
     use crate::net::ToBytes;
-    use crate::net::parameter::ParameterValue;
 
-    use super::Parameters;
+    use super::*;
+
+    pub(crate) fn new_test(name: &str) -> Parameters {
+        Parameters::from(vec![
+            Parameter::from(("application_name", name)),
+            Parameter::from(("pgdog.test_mode", "1")),
+        ])
+    }
 
     #[test]
     fn test_identical() {

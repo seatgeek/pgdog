@@ -1,7 +1,7 @@
 use crate::frontend::SetParam;
 use crate::frontend::client::query_engine::fake::FakeResponse;
 use crate::frontend::router::parameter_hints::{PGDOG_PIN, PGDOG_SHARD, PGDOG_SHARDING_KEY};
-use crate::net::messages::ErrorResponse;
+use crate::net::messages::{ErrorResponse, NoticeResponse};
 
 use super::*;
 
@@ -16,16 +16,27 @@ impl QueryEngine {
     pub(crate) async fn set(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        // FIXME(sage): Remove mut
+        client_request: &mut ClientRequest,
         params: &[SetParam],
         set_config: bool,
     ) -> Result<(), Error> {
         // Make sure client isn't changing route mid-transaction.
-        if self.route_change_check(context, params).await? {
+        if self
+            .route_change_check(context, client_request, params)
+            .await?
+        {
             return Ok(());
         }
 
+        let set_local_outside_transaction =
+            !context.in_transaction() && params.iter().any(|param| param.local);
         let mut fake_command = "SET";
         for param in params {
+            if !context.in_transaction() && param.local {
+                continue;
+            }
+
             let is_pin = param.name == PGDOG_PIN;
 
             if let Some(value) = param.value.clone() {
@@ -58,12 +69,21 @@ impl QueryEngine {
         }
 
         if self.backend.connected() {
-            self.execute(context, None).await?;
+            self.execute(context, client_request, None).await?;
         } else {
-            let fake_response = set_config
-                .then(|| params.iter().map(|p| p.value.as_ref()))
-                .map(|values| FakeResponse::new_params(&["set_config"], values));
-            self.fake_command_response(context, fake_command, fake_response)
+            let mut response = FakeResponse::command(fake_command);
+            if set_config {
+                response = response.with_params(
+                    &["set_config"],
+                    params.iter().map(|param| param.value.as_ref()),
+                );
+            }
+            if set_local_outside_transaction {
+                response = response.with_notice(NoticeResponse::from(
+                    ErrorResponse::set_local_outside_transaction(),
+                ));
+            }
+            self.fake_command_response(context, &client_request.messages, &response)
                 .await?;
         }
 
@@ -75,6 +95,7 @@ impl QueryEngine {
     async fn route_change_check(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        client_request: &ClientRequest,
         params: &[SetParam],
     ) -> Result<bool, Error> {
         if !self.backend.connected() {
@@ -82,15 +103,20 @@ impl QueryEngine {
         }
 
         let Some(param) = params.iter().find(|param| {
-            SHARD_TARGETING_PARAMS
-                .iter()
-                .any(|name| param.name.eq_ignore_ascii_case(name))
+            (context.in_transaction() || !param.local)
+                && SHARD_TARGETING_PARAMS
+                    .iter()
+                    .any(|name| param.name.eq_ignore_ascii_case(name))
         }) else {
             return Ok(false);
         };
 
-        self.error_response(context, ErrorResponse::set_shard_after_connect(&param.name))
-            .await?;
+        self.error_response(
+            context,
+            client_request,
+            ErrorResponse::set_shard_after_connect(&param.name),
+        )
+        .await?;
 
         Ok(true)
     }
@@ -98,13 +124,25 @@ impl QueryEngine {
     pub(crate) async fn reset_all(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        // FIXME(sage): Remove mut
+        client_request: &mut ClientRequest,
     ) -> Result<(), Error> {
-        context.params.reset_all();
+        if context.in_transaction() || self.backend.connected() {
+            context.params.reset_all();
+        } else {
+            context.params.restore_startup(context.startup_params);
+            self.comms.update_params(context.params);
+        }
 
         if self.backend.connected() {
-            self.execute(context, None).await?;
+            self.execute(context, client_request, None).await?;
         } else {
-            self.fake_command_response(context, "RESET", None).await?;
+            self.fake_command_response(
+                context,
+                &client_request.messages,
+                &FakeResponse::command("RESET"),
+            )
+            .await?;
         }
 
         Ok(())

@@ -16,11 +16,13 @@ pub mod copy_data;
 pub mod replication;
 pub mod reshard;
 pub mod schema_sync;
+pub mod synchronize_tables;
 
 pub use copy_data::*;
 pub use replication::*;
 pub use reshard::*;
 pub use schema_sync::*;
+pub use synchronize_tables::*;
 
 /// Identity of a task in the registry. Ids are unique per registry.
 #[derive(
@@ -65,6 +67,7 @@ pub enum TaskStatus {
     SchemaShard(SchemaShardStatus),
     TableCopy(TableCopyStatus),
     CopyData(CopyDataStatus),
+    SynchronizeTables(SynchronizeTablesStatus),
     // in progress, not used
     Replication(ReplicationStatus),
     ReplicationCluster(ReplicationClusterStatus),
@@ -543,6 +546,10 @@ mod test {
                 SyncState::Cutover,
                 "schema_sync(cutover) prod -> prod_sharded",
             ),
+            (
+                SyncState::PostDataValidation,
+                "schema_sync(post_data_validation) prod -> prod_sharded",
+            ),
         ] {
             assert_eq!(
                 TaskDefinition::from(SchemaSyncDefinition {
@@ -626,6 +633,7 @@ mod test {
                 stage: CopyDataStage::CopyingTables,
                 tables_per_shard: Some(vec![5, 3]),
             }),
+            TaskStatus::SynchronizeTables(SynchronizeTablesStatus::InitializingReplicationStreams),
             TaskStatus::SchemaSync(SchemaSyncStatus::ApplyingStatements {
                 statements: Arc::new(vec![
                     SchemaSyncStatement::new("CREATE INDEX ...").set_skip_if_exists(),
@@ -703,6 +711,7 @@ mod test {
                 TaskStatus::RatioProgress(_)
                 | TaskStatus::Reshard(_)
                 | TaskStatus::CopyData(_)
+                | TaskStatus::SynchronizeTables(_)
                 | TaskStatus::SchemaSync(_)
                 | TaskStatus::SchemaShard(_)
                 | TaskStatus::TableCopy(_)
@@ -790,6 +799,14 @@ mod test {
             serde_json::from_str::<TaskStatus>(r#"{"kind":"replication","status":"new_stage"}"#)
                 .unwrap(),
             TaskStatus::Replication(ReplicationStatus::Other)
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskDefinition>(
+                r#"{"name":"schema_sync","kind":"schema_sync","databases":{"source":"prod","destination":"prod_sharded"},"sync_state":"new_phase","ignore_errors":false,"dry_run":false}"#
+            )
+            .unwrap()
+            .to_string(),
+            "schema_sync(unknown) prod -> prod_sharded"
         );
 
         assert_eq!(

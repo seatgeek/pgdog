@@ -3,8 +3,8 @@ use crate::{
     config::{config, load_test_sharded, set},
     expect_message,
     net::{
-        BindComplete, CommandComplete, ErrorResponse, NoData, ParameterDescription, ParseComplete,
-        ReadyForQuery, parameter::ParameterValue,
+        BindComplete, CommandComplete, ErrorResponse, NoData, NoticeResponse, ParameterDescription,
+        ParseComplete, ReadyForQuery, parameter::ParameterValue,
     },
 };
 
@@ -43,6 +43,63 @@ async fn test_set() {
     );
 
     assert!(!test_client.backend_locked());
+}
+
+#[tokio::test]
+async fn test_set_local_outside_transaction_warns_and_has_no_effect() {
+    let mut client = TestClient::new_sharded(Parameters::default()).await;
+
+    client
+        .send_simple(Query::new("SET LOCAL application_name TO 'ignored'"))
+        .await;
+
+    let notice = expect_message!(client.read().await, NoticeResponse);
+    assert_eq!(notice.message.severity, "WARNING");
+    assert_eq!(notice.message.code, "25P01");
+    assert_eq!(
+        notice.message.message,
+        "SET LOCAL can only be used in transaction blocks"
+    );
+    assert_eq!(
+        expect_message!(client.read().await, CommandComplete).command(),
+        "SET"
+    );
+    assert_eq!(
+        expect_message!(client.read().await, ReadyForQuery).status,
+        'I'
+    );
+    assert_eq!(client.client().params.get("application_name"), None);
+    assert!(!client.backend_connected());
+}
+
+#[tokio::test]
+async fn test_extended_set_local_outside_transaction_warns_and_has_no_effect() {
+    let mut client = TestClient::new_sharded(Parameters::default()).await;
+
+    client
+        .send(Parse::named(
+            "set_local",
+            "SET LOCAL application_name TO 'ignored'",
+        ))
+        .await;
+    client.send(Bind::new_statement("set_local")).await;
+    client.send(Execute::new()).await;
+    client.send(Sync).await;
+    client.try_process().await.unwrap();
+
+    expect_message!(client.read().await, ParseComplete);
+    expect_message!(client.read().await, BindComplete);
+    expect_message!(client.read().await, NoticeResponse);
+    assert_eq!(
+        expect_message!(client.read().await, CommandComplete).command(),
+        "SET"
+    );
+    assert_eq!(
+        expect_message!(client.read().await, ReadyForQuery).status,
+        'I'
+    );
+    assert_eq!(client.client().params.get("application_name"), None);
+    assert!(!client.backend_connected());
 }
 
 #[tokio::test]
@@ -760,5 +817,51 @@ async fn test_lock_timeout() {
     assert!(
         test_client.client().params.get("lock_timeout").is_none(),
         "lock_timeout should be cleared after RESET"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_all_restores_startup_parameters() {
+    let mut startup = Parameters::default();
+    startup.insert("search_path", "s1");
+    startup.insert("timezone", "Asia/Tokyo");
+    let mut client = TestClient::new_sharded(startup.clone()).await;
+
+    for query in [
+        "SET search_path TO runtime",
+        "SET timezone TO 'Europe/Paris'",
+        "SET statement_timeout TO '5s'",
+        "RESET ALL",
+        "ROLLBACK",
+    ] {
+        client.send_simple(Query::new(query)).await;
+        client.read_until('Z').await.expect("command completed");
+    }
+    assert_eq!(
+        client.client().params.get("search_path"),
+        startup.get("search_path")
+    );
+    assert_eq!(
+        client.client().params.get("timezone"),
+        startup.get("timezone")
+    );
+    assert_eq!(client.client().params.get("statement_timeout"), None);
+}
+
+#[tokio::test]
+async fn test_reset_all_keeps_transaction_rollback() {
+    let mut client = TestClient::new_sharded(Parameters::default()).await;
+    for query in [
+        "SET search_path TO runtime",
+        "BEGIN",
+        "RESET ALL",
+        "ROLLBACK",
+    ] {
+        client.send_simple(Query::new(query)).await;
+        client.read_until('Z').await.expect("command completed");
+    }
+    assert_eq!(
+        client.client().params.get("search_path"),
+        Some(&ParameterValue::String("runtime".into()))
     );
 }

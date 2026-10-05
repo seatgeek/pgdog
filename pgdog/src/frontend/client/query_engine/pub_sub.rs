@@ -1,14 +1,18 @@
 use super::*;
+use crate::frontend::client::query_engine::fake::FakeResponse;
+use crate::net::ProtocolMessage;
 
 impl QueryEngine {
     pub(super) async fn listen(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        client_messages: &[ProtocolMessage],
         channel: &str,
         shard: Shard,
     ) -> Result<(), Error> {
         self.backend.listen(channel, shard).await?;
-        self.fake_command_response(context, "LISTEN", None).await?;
+        self.fake_command_response(context, client_messages, &FakeResponse::command("LISTEN"))
+            .await?;
 
         Ok(())
     }
@@ -16,6 +20,7 @@ impl QueryEngine {
     pub(super) async fn notify(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        client_messages: &[ProtocolMessage],
         channel: &str,
         payload: &str,
         shard: &Shard,
@@ -28,17 +33,19 @@ impl QueryEngine {
             // Send immediately if not in transaction
             self.backend.notify(channel, payload, shard.clone()).await?;
         }
-        self.fake_command_response(context, "NOTIFY", None).await?;
+        self.fake_command_response(context, client_messages, &FakeResponse::command("NOTIFY"))
+            .await?;
         Ok(())
     }
 
     pub(super) async fn unlisten(
         &mut self,
         context: &mut QueryEngineContext<'_>,
+        client_messages: &[ProtocolMessage],
         channel: &str,
     ) -> Result<(), Error> {
         self.backend.unlisten(channel);
-        self.fake_command_response(context, "UNLISTEN", None)
+        self.fake_command_response(context, client_messages, &FakeResponse::command("UNLISTEN"))
             .await?;
         Ok(())
     }

@@ -39,10 +39,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             arch: arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     env:
       VERSION: ${{ inputs.version }}
       ARTIFACT: pgdog-${{ inputs.version }}-${{ matrix.arch }}
@@ -107,7 +107,7 @@ jobs:
   release:
     needs: build
     if: ${{ inputs.publish_release }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     env:
       VERSION: ${{ inputs.version }}
       TAG: v${{ inputs.version }}

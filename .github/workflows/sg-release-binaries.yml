@@ -1,0 +1,92 @@
+# SeatGeek fork: build Linux binaries named for base-ami bootstrap.
+#
+# Artifacts match cookbooks/seatgeek_base/recipes/pgdog.rb:
+#   s3://sg-deploy-artifacts/bootstrap/pgDog/pgdog-<version>-<amd64|arm64>
+#
+# Default version is 1.60-sg1 (upstream 0.1.60 + SeatGeek patch). Override
+# via workflow_dispatch when cutting a new sg build.
+name: sg-release-binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Artifact version suffix (e.g. 1.60-sg1)
+        required: true
+        default: "1.60-sg1"
+      upload_s3:
+        description: Upload binaries to s3://sg-deploy-artifacts/bootstrap/pgDog/
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
+    env:
+      VERSION: ${{ inputs.version }}
+      ARTIFACT: pgdog-${{ inputs.version }}-${{ matrix.arch }}
+      S3_URI: s3://sg-deploy-artifacts/bootstrap/pgDog/pgdog-${{ inputs.version }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Mirrors docker/Dockerfile.base-builder: cmake + clang for aws-lc-sys,
+      # libssl-dev for openssl-sys, mold is the linker pinned in .cargo/config.toml.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake clang pkg-config libssl-dev mold
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p pgdog
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/pgdog" "dist/${ARTIFACT}"
+          chmod 755 "dist/${ARTIFACT}"
+          shasum -a 256 "dist/${ARTIFACT}" | tee "dist/${ARTIFACT}.sha256"
+
+      - name: Upload GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: |
+            dist/${{ env.ARTIFACT }}
+            dist/${{ env.ARTIFACT }}.sha256
+          if-no-files-found: error
+
+      - name: Configure AWS credentials
+        if: ${{ inputs.upload_s3 }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Upload to S3
+        if: ${{ inputs.upload_s3 }}
+        run: |
+          aws s3 cp "dist/${ARTIFACT}" "${S3_URI}"
+          aws s3 cp "dist/${ARTIFACT}.sha256" "${S3_URI}.sha256"
+          echo "Uploaded ${S3_URI}"

@@ -99,8 +99,8 @@ impl Address {
     ///
     /// For external identity providers the token is served from the global
     /// [`TokenCache`], which is kept warm by the pool monitor. This call
-    /// only blocks on the very first connection before the monitor has had
-    /// a chance to prime the cache.
+    /// blocks on a cold miss, or when a cached token has under 10s of
+    /// validity left and must be refreshed inline.
     pub(crate) async fn auth_secrets(&self) -> Result<Vec<Password>, Error> {
         Ok(self.auth_credentials().await?.1)
     }
@@ -684,21 +684,20 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_auth_secret_stale_token_still_returned() {
-        // A stale token (past its expiry) is still handed to the server.
-        // The monitor is responsible for refreshing it; auth_secrets never
-        // blocks on a refresh.
+    async fn test_auth_secret_cached_token_returned() {
+        // A still-valid cached token is returned without fetching.
+        // Expired / nearly-expired inline refetch is covered in token_cache tests.
         let addr = Address {
-            host: "auth-secrets-stale.internal".into(),
+            host: "auth-secrets-cached.internal".into(),
             port: 15434,
-            user: "stale_user".into(),
+            user: "cached_user".into(),
             server_auth: ServerAuth::RdsIam,
             server_iam_region: Some("eu-west-1".into()),
             ..Default::default()
         };
 
-        let stale_expiry = SystemTime::now() - Duration::from_secs(60);
-        TokenCache::global().set(&addr, "stale-token".into(), stale_expiry);
+        let expiry = SystemTime::now() + Duration::from_secs(3600);
+        TokenCache::global().set(&addr, "cached-token".into(), expiry);
 
         let secret = addr
             .auth_secrets()
@@ -710,7 +709,7 @@ mod test {
 
         TokenCache::global().evict(&addr);
 
-        assert_eq!(secret, "stale-token");
+        assert_eq!(secret, "cached-token");
     }
 
     #[tokio::test]

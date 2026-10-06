@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   warm:
-    runs-on: ${{ matrix.runner || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ${{ matrix.runner || 'ubuntu-24.04' }}
     timeout-minutes: 30
     container:
       image: ghcr.io/pgdogdev/pgdog-ci:v2
@@ -45,7 +45,7 @@ jobs:
           - name: build
             prefix: build-cov-debug-v2
             shared: build
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-24.04
             save_binary: true
             run: bash integration/ci/prepare-instrumented-pgdog.sh debug
           - name: integration

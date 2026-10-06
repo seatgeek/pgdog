@@ -1488,7 +1488,10 @@ async fn test_auto_mode_waits_for_primary_election() {
 
 #[tokio::test]
 async fn test_auto_mode_primary_election_releases_writes() {
-    let config = create_auto_test_pool_config("127.0.0.1", 5432);
+    let mut config = create_auto_test_pool_config("127.0.0.1", 5432);
+    // The helper's 50ms checkout timeout loses the race against the delayed
+    // election task on slower CI runners (llvm-cov on GitHub-hosted Ubuntu).
+    config.config.checkout_timeout = Duration::from_secs(2);
     let lb = LoadBalancer::new(
         &None,
         &[config],
@@ -1515,8 +1518,11 @@ async fn test_auto_mode_primary_election_releases_writes() {
 
 #[tokio::test]
 async fn test_auto_mode_waits_for_each_new_primary() {
-    let first = create_auto_test_pool_config("127.0.0.1", 5432);
-    let second = create_auto_test_pool_config("localhost", 5432);
+    let mut first = create_auto_test_pool_config("127.0.0.1", 5432);
+    let mut second = create_auto_test_pool_config("localhost", 5432);
+    // The helper's 50ms checkout timeout is too short under coverage instrumentation.
+    first.config.checkout_timeout = Duration::from_secs(2);
+    second.config.checkout_timeout = Duration::from_secs(2);
 
     let lb = LoadBalancer::new(
         &None,
